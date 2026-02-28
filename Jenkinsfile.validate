@@ -1,0 +1,246 @@
+pipeline {
+    agent any
+
+    options {
+        timestamps()
+    }
+
+    environment {
+        DOCKER_IMAGE   = 'wine_predict_2022bcs0168'
+        CONTAINER_NAME = "wine_test_${BUILD_NUMBER}"
+        API_PORT       = '9000'
+    }
+
+    stages {
+
+        // -------------------------------------------------------
+        // Stage 1: Pull the inference Docker image from Docker Hub
+        // -------------------------------------------------------
+        stage('Pull Image') {
+            steps {
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'DOCKERHUB',
+                        usernameVariable: 'DH_USER',
+                        passwordVariable: 'DH_PASS'
+                    )
+                ]) {
+                    sh '''
+                        set -euxo pipefail
+                        echo "${DH_PASS}" | docker login -u "${DH_USER}" --password-stdin
+                        docker pull ${DH_USER}/${DOCKER_IMAGE}:latest
+                    '''
+                }
+                echo 'Docker image pulled successfully.'
+            }
+        }
+
+        // -------------------------------------------------------
+        // Stage 2: Start the container exposing the API port
+        // -------------------------------------------------------
+        stage('Run Container') {
+            steps {
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'DOCKERHUB',
+                        usernameVariable: 'DH_USER',
+                        passwordVariable: 'DH_PASS'
+                    )
+                ]) {
+                    sh '''
+                        set -euxo pipefail
+                        docker run -d \
+                            --name ${CONTAINER_NAME} \
+                            -p ${API_PORT}:8000 \
+                            ${DH_USER}/${DOCKER_IMAGE}:latest
+                    '''
+                }
+                echo "Container ${CONTAINER_NAME} started on port ${API_PORT}."
+            }
+        }
+
+        // -------------------------------------------------------
+        // Stage 3: Wait until the API is ready (health check)
+        // -------------------------------------------------------
+        stage('Wait for API Readiness') {
+            steps {
+                sh '''
+                    set -euo pipefail
+                    MAX_ATTEMPTS=30
+                    for i in $(seq 1 $MAX_ATTEMPTS); do
+                        if curl -sf http://localhost:${API_PORT}/health > /dev/null 2>&1; then
+                            echo "API is ready! (attempt $i)"
+                            exit 0
+                        fi
+                        echo "Waiting for API... attempt $i/$MAX_ATTEMPTS"
+                        sleep 2
+                    done
+                    echo "ERROR: API failed to start within timeout!"
+                    exit 1
+                '''
+            }
+        }
+
+        // -------------------------------------------------------
+        // Stage 4: Send a valid inference request and validate
+        // -------------------------------------------------------
+        stage('Test Valid Inference') {
+            steps {
+                script {
+                    def response = sh(
+                        script: '''
+                            curl -sf -X POST http://localhost:${API_PORT}/predict \
+                                -H "Content-Type: application/json" \
+                                -d '{
+                                    "fixed_acidity": 7.4,
+                                    "volatile_acidity": 0.7,
+                                    "citric_acid": 0.0,
+                                    "residual_sugar": 1.9,
+                                    "chlorides": 0.076,
+                                    "free_sulfur_dioxide": 11.0,
+                                    "total_sulfur_dioxide": 34.0,
+                                    "density": 0.9978,
+                                    "pH": 3.51,
+                                    "sulphates": 0.56,
+                                    "alcohol": 9.4
+                                }'
+                        ''',
+                        returnStdout: true
+                    ).trim()
+
+                    echo "Valid Request Response: ${response}"
+
+                    // Check wine_quality field exists
+                    def wineQuality = sh(
+                        script: "echo '${response}' | jq -r '.wine_quality'",
+                        returnStdout: true
+                    ).trim()
+
+                    if (wineQuality == 'null' || wineQuality == '') {
+                        error "FAIL: 'wine_quality' field is missing from response!"
+                    }
+
+                    // Check wine_quality is numeric
+                    sh "echo '${wineQuality}' | grep -qE '^-?[0-9]+\$'"
+
+                    echo "PASS: Valid inference test succeeded. Predicted quality = ${wineQuality}"
+                }
+            }
+        }
+
+        // -------------------------------------------------------
+        // Stage 5: Send invalid requests and validate error handling
+        // -------------------------------------------------------
+        stage('Test Invalid Inference') {
+            steps {
+                script {
+
+                    // --- Test 5a: Missing fields (only 1 of 11 provided) ---
+                    echo '--- Test 5a: Missing Fields ---'
+
+                    def status5a = sh(
+                        script: '''
+                            curl -s -o /tmp/resp_5a.json -w "%{http_code}" \
+                                -X POST http://localhost:${API_PORT}/predict \
+                                -H "Content-Type: application/json" \
+                                -d '{"fixed_acidity": 7.4}'
+                        ''',
+                        returnStdout: true
+                    ).trim()
+
+                    def body5a = sh(script: 'cat /tmp/resp_5a.json', returnStdout: true).trim()
+                    echo "Status: ${status5a} | Body: ${body5a}"
+
+                    if (status5a != '422') {
+                        error "FAIL 5a: Expected HTTP 422 for missing fields, got ${status5a}"
+                    }
+                    sh "cat /tmp/resp_5a.json | jq '.detail' | grep -qi 'missing'"
+                    echo 'PASS 5a: Missing fields correctly rejected with 422.'
+
+
+                    // --- Test 5b: Wrong types (strings instead of floats) ---
+                    echo '--- Test 5b: Wrong Types ---'
+
+                    def status5b = sh(
+                        script: '''
+                            curl -s -o /tmp/resp_5b.json -w "%{http_code}" \
+                                -X POST http://localhost:${API_PORT}/predict \
+                                -H "Content-Type: application/json" \
+                                -d '{
+                                    "fixed_acidity": "hello",
+                                    "volatile_acidity": "world",
+                                    "citric_acid": "bad",
+                                    "residual_sugar": "data",
+                                    "chlorides": "here",
+                                    "free_sulfur_dioxide": "not",
+                                    "total_sulfur_dioxide": "a",
+                                    "density": "number",
+                                    "pH": "at",
+                                    "sulphates": "all",
+                                    "alcohol": "nope"
+                                }'
+                        ''',
+                        returnStdout: true
+                    ).trim()
+
+                    def body5b = sh(script: 'cat /tmp/resp_5b.json', returnStdout: true).trim()
+                    echo "Status: ${status5b} | Body: ${body5b}"
+
+                    if (status5b != '422') {
+                        error "FAIL 5b: Expected HTTP 422 for wrong types, got ${status5b}"
+                    }
+                    sh "cat /tmp/resp_5b.json | jq '.detail' | grep -qi 'type'"
+                    echo 'PASS 5b: Wrong types correctly rejected with 422.'
+
+
+                    // --- Test 5c: Empty body ---
+                    echo '--- Test 5c: Empty Body ---'
+
+                    def status5c = sh(
+                        script: '''
+                            curl -s -o /tmp/resp_5c.json -w "%{http_code}" \
+                                -X POST http://localhost:${API_PORT}/predict \
+                                -H "Content-Type: application/json" \
+                                -d '{}'
+                        ''',
+                        returnStdout: true
+                    ).trim()
+
+                    def body5c = sh(script: 'cat /tmp/resp_5c.json', returnStdout: true).trim()
+                    echo "Status: ${status5c} | Body: ${body5c}"
+
+                    if (status5c != '422') {
+                        error "FAIL 5c: Expected HTTP 422 for empty body, got ${status5c}"
+                    }
+                    sh "cat /tmp/resp_5c.json | jq '.detail' | grep -qi 'missing'"
+                    echo 'PASS 5c: Empty body correctly rejected with 422.'
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------
+    // Post: Cleanup container + report result
+    // -----------------------------------------------------------
+    post {
+        always {
+            sh '''
+                docker stop ${CONTAINER_NAME} || true
+                docker rm   ${CONTAINER_NAME} || true
+            '''
+            echo "Container ${CONTAINER_NAME} stopped and removed."
+        }
+
+        success {
+            echo '====================================='
+            echo ' ALL INFERENCE TESTS PASSED'
+            echo '====================================='
+        }
+
+        failure {
+            echo '====================================='
+            echo ' INFERENCE VALIDATION FAILED'
+            echo '====================================='
+        }
+    }
+}

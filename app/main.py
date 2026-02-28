@@ -16,6 +16,10 @@ model = joblib.load("model/model.joblib")
 def root():
     return RedirectResponse(url="/docs", status_code=301)
 
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
 @app.post("/predict")
 def predict(data: WineInput):
     features = np.array([[

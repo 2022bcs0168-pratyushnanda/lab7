@@ -41,6 +41,6 @@ def predict(data: WineInput):
     return {
         "name": NAME,
         "roll_no": ROLL_NO,
-        "wrong_key": int(round(float(prediction)))
+        "wine_quality": int(round(float(prediction)))
     }
 

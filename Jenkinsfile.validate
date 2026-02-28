@@ -8,7 +8,6 @@ pipeline {
     environment {
         DOCKER_IMAGE   = 'wine_predict_2022bcs0168'
         CONTAINER_NAME = "wine_test_${BUILD_NUMBER}"
-        API_PORT       = '9000'
     }
 
     stages {
@@ -51,11 +50,19 @@ pipeline {
                         set -euxo pipefail
                         docker run -d \
                             --name ${CONTAINER_NAME} \
-                            -p ${API_PORT}:8000 \
                             ${DH_USER}/${DOCKER_IMAGE}:latest
                     '''
                 }
-                echo "Container ${CONTAINER_NAME} started on port ${API_PORT}."
+
+                // Get the container's IP address for direct communication
+                script {
+                    env.CONTAINER_IP = sh(
+                        script: "docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' ${CONTAINER_NAME}",
+                        returnStdout: true
+                    ).trim()
+                }
+
+                echo "Container ${CONTAINER_NAME} started at IP ${CONTAINER_IP}."
             }
         }
 
@@ -68,7 +75,7 @@ pipeline {
                     set -euo pipefail
                     MAX_ATTEMPTS=30
                     for i in $(seq 1 $MAX_ATTEMPTS); do
-                        if curl -sf http://localhost:${API_PORT}/health > /dev/null 2>&1; then
+                        if curl -sf http://${CONTAINER_IP}:8000/health > /dev/null 2>&1; then
                             echo "API is ready! (attempt $i)"
                             exit 0
                         fi
@@ -89,7 +96,7 @@ pipeline {
                 script {
                     def response = sh(
                         script: '''
-                            curl -sf -X POST http://localhost:${API_PORT}/predict \
+                            curl -sf -X POST http://${CONTAINER_IP}:8000/predict \
                                 -H "Content-Type: application/json" \
                                 -d '{
                                     "fixed_acidity": 7.4,
@@ -141,7 +148,7 @@ pipeline {
                     def status5a = sh(
                         script: '''
                             curl -s -o /tmp/resp_5a.json -w "%{http_code}" \
-                                -X POST http://localhost:${API_PORT}/predict \
+                                -X POST http://${CONTAINER_IP}:8000/predict \
                                 -H "Content-Type: application/json" \
                                 -d '{"fixed_acidity": 7.4}'
                         ''',
@@ -164,7 +171,7 @@ pipeline {
                     def status5b = sh(
                         script: '''
                             curl -s -o /tmp/resp_5b.json -w "%{http_code}" \
-                                -X POST http://localhost:${API_PORT}/predict \
+                                -X POST http://${CONTAINER_IP}:8000/predict \
                                 -H "Content-Type: application/json" \
                                 -d '{
                                     "fixed_acidity": "hello",
@@ -199,7 +206,7 @@ pipeline {
                     def status5c = sh(
                         script: '''
                             curl -s -o /tmp/resp_5c.json -w "%{http_code}" \
-                                -X POST http://localhost:${API_PORT}/predict \
+                                -X POST http://${CONTAINER_IP}:8000/predict \
                                 -H "Content-Type: application/json" \
                                 -d '{}'
                         ''',
